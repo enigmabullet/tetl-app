@@ -16195,6 +16195,7 @@ ${serverError}`);
         if (item.actorId !== actorId) throw Error("Hay cambios de otra cuenta en este dispositivo");
         await graph.stage(item.id, item.kind, JSON.parse(item.raw));
       }
+      let receipts = null;
       if (waiting.length) {
         try {
           journal = await graph.changes(journal.deltaLink, rows);
@@ -16203,7 +16204,7 @@ ${serverError}`);
           journal = await graph.changes();
         }
         rows = journal.rows;
-        const receipts = replay(rows).receipts;
+        receipts = replay(rows, catalog || []).receipts;
         for (const item of waiting) {
           const receipt = receipts[item.id];
           if (!receipt || receipt.submitted_by !== actorId)
@@ -16220,9 +16221,11 @@ ${serverError}`);
       };
       await queue.snapshot(cached);
       const items = await queue.all();
+      receipts ||= replay(rows, catalog || []).receipts;
+      const status = (item) => (receipts[item.id] || item.receipt)?.result?.status;
       const pending = items.filter((item) => !item.receipt).length;
-      const confirmed = items.filter((item) => item.receipt?.result?.status === "accepted").length;
-      const conflicts = items.filter((item) => item.receipt?.result?.status !== "accepted" && item.receipt).length;
+      const confirmed = items.filter((item) => status(item) === "accepted").length;
+      const conflicts = items.filter((item) => status(item) && status(item) !== "accepted").length;
       notify(pending ? pending + " cambio(s) pendientes en este dispositivo." : "SharePoint confirm\xF3 los cambios." + (confirmed ? " " + confirmed + " cambio(s) recibido(s)." : "") + (conflicts ? " " + conflicts + " conflicto(s) por revisar." : ""));
     } catch (error) {
       notify("Sin conexi\xF3n o sin acceso: " + String(error?.message || error));

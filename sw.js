@@ -1,4 +1,4 @@
-const VERSION = '8e585d71b2f0';
+const VERSION = 'cf6a91105a03';
 const CACHE = 'tetl-native-pilot-' + VERSION;
 const SHELL = ['./', ...['index.html', 'config.json', 'app.js', 'pilot-bridge.js', 'app.css',
   'pilot-ui.css', 'i18n.js', 'manifest.webmanifest', 'ui/icon-192.png', 'ui/icon-512.png',
