@@ -1,4 +1,11 @@
 /* Compact listing facts in the development pilot. The released UI is unchanged. */
+.pilot-gate { min-height: 100dvh; display: grid; place-items: center; padding: 24px; background: #dde3ea; color: #18232b; }
+.pilot-gate-card { width: min(100%, 360px); padding: 36px 28px; text-align: center; background: #fff; border: 1px solid #cdd5db; border-radius: 20px; box-shadow: 0 18px 48px #18232b17; }
+.pilot-gate-card img { border-radius: 16px; }
+.pilot-gate-card h1 { margin: 12px 0 8px; font-size: 28px; }
+.pilot-gate-card p { min-height: 44px; margin: 0 0 18px; line-height: 1.5; }
+.pilot-gate-card button { width: 100%; min-height: 44px; }
+.pilot-gate-card button[hidden] { display: none; }
 .d-main .kv { margin: 8px 0 12px; }
 .d-main .kv > div { padding: 5px 8px; }
 .d-main .kv .k { font-size: 10px; line-height: 1.2; }

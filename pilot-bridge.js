@@ -15543,7 +15543,11 @@ ${serverError}`);
       } catch (_) {
         throw Error("Microsoft identity is unreachable");
       }
-      if (!response.ok) throw Error("Microsoft identity returned HTTP " + response.status);
+      if (!response.ok) {
+        const error = Error("Microsoft identity returned HTTP " + response.status);
+        error.status = response.status;
+        throw error;
+      }
       const id = (await response.json()).id;
       if (typeof id !== "string" || !id) throw Error("Microsoft did not identify the user");
       return id;
@@ -15607,6 +15611,7 @@ ${serverError}`);
       this.transport = transport;
       this.images = /* @__PURE__ */ new Map();
       this.loading = /* @__PURE__ */ new Map();
+      this.disposed = false;
     }
     async download(path) {
       const parts = pathParts(path);
@@ -15640,6 +15645,7 @@ ${serverError}`);
       return (await this.download(path)).json();
     }
     photoUrl(adId, file, onReady) {
+      if (this.disposed) return null;
       const key = adId + "/" + file;
       if (this.images.has(key)) return this.images.get(key);
       if (!this.loading.has(key)) {
@@ -15647,6 +15653,7 @@ ${serverError}`);
         pathParts(file);
         const path = this.mediaRoot + "/" + key;
         const task = this.download(path).then((response) => response.blob()).then((blob) => {
+          if (this.disposed) return;
           if (!blob.type.startsWith("image/")) throw Error("Private media is not an image");
           this.images.set(key, URL.createObjectURL(blob));
           onReady?.();
@@ -15657,6 +15664,7 @@ ${serverError}`);
       return null;
     }
     dispose() {
+      this.disposed = true;
       for (const url of this.images.values()) URL.revokeObjectURL(url);
       this.images.clear();
     }
@@ -15755,7 +15763,7 @@ ${serverError}`);
   // native-bridge.js
   var SCOPES = ["User.Read", "Sites.Selected"];
   var ASSET_VERSION = new URL(document.currentScript?.src || location.href).searchParams.get("v") || "";
-  var DEMO = new URL(location.href).searchParams.has("demo");
+  var DEMO = ["localhost", "127.0.0.1"].includes(location.hostname) && new URL(location.href).searchParams.has("demo");
   var now = () => (/* @__PURE__ */ new Date()).toISOString();
   var safe = (value) => String(value ?? "").replace(
     /[&<>"']/g,
@@ -15823,6 +15831,8 @@ ${serverError}`);
   var cached = null;
   var knownListings = [];
   var recoverable = [];
+  var accessConfirmed = false;
+  var canSignIn = false;
   var pilot = window.TETL_PILOT = {
     api,
     banner,
@@ -15832,11 +15842,42 @@ ${serverError}`);
     controls,
     fixedSearches,
     searchForm,
-    sync
+    sync,
+    reveal
   };
-  var ready = initialize();
+  var ready = initialize().catch(() => lock("No se pudo confirmar el acceso. Recarga Tetl para reintentar."));
+  function lock(message) {
+    accessConfirmed = false;
+    document.documentElement.classList.remove("tetl-authenticated");
+    files?.dispose();
+    files = null;
+    catalog = null;
+    catalogById = null;
+    rows = [];
+    actorId = null;
+    knownListings = [];
+    recoverable = [];
+    const state = window.TETL_DEBUG;
+    if (state) {
+      state.listings = [];
+      state.queue = [];
+      state.searches = [];
+      state.detail = null;
+      state.loaded = false;
+    }
+    for (const selector of ["#content", "#filters", "#drawer", "#banner"])
+      document.querySelector(selector)?.replaceChildren();
+    notify(message);
+  }
+  function reveal() {
+    if (accessConfirmed) document.documentElement.classList.add("tetl-authenticated");
+  }
   function notify(message) {
     stateText = message;
+    const gateStatus = document.querySelector("#pilot-gate-status");
+    if (gateStatus) gateStatus.textContent = message;
+    const signIn = document.querySelector("#pilot-signin");
+    if (signIn) signIn.hidden = !canSignIn || accessConfirmed || DEMO;
     pilot.refresh?.();
     const s = window.TETL_DEBUG;
     if (s?.loaded && typeof s === "object") {
@@ -15857,12 +15898,15 @@ ${serverError}`);
     try {
       return (await msal.acquireTokenSilent({ account, scopes: SCOPES })).accessToken;
     } catch (_) {
-      notify("La sesi\xF3n termin\xF3. Entra con Microsoft para continuar.");
+      lock("La sesi\xF3n termin\xF3. Entra con Microsoft para continuar.");
       throw Error("La sesi\xF3n de Microsoft termin\xF3");
     }
   }
   async function initialize() {
-    if (DEMO) return;
+    if (DEMO) {
+      accessConfirmed = true;
+      return;
+    }
     queue = await PilotQueue.open();
     cached = await queue.snapshot();
     try {
@@ -15870,12 +15914,6 @@ ${serverError}`);
       if (!response.ok) throw Error("Pilot configuration unavailable");
       config = await response.json();
     } catch (_) {
-      if (!navigator.onLine && cached?.actorId && Array.isArray(cached.rows)) {
-        actorId = cached.actorId;
-        rows = cached.rows;
-        notify("Copia local sin conexi\xF3n. Inicia sesi\xF3n con la misma cuenta al reconectar.");
-        return;
-      }
       notify("No se pudo cargar la configuraci\xF3n del piloto. Recarga la p\xE1gina al reconectar.");
       return;
     }
@@ -15890,35 +15928,34 @@ ${serverError}`);
       redirectUri: location.origin + location.pathname
     }, cache: { cacheLocation: "sessionStorage" } });
     await msal.initialize();
+    canSignIn = true;
     const result = await msal.handleRedirectPromise();
     const accounts = msal.getAllAccounts();
     account = result?.account || accounts.find((item) => item.homeAccountId === cached?.homeAccountId) || (accounts.length === 1 ? accounts[0] : null);
     if (!account) {
-      if (!navigator.onLine && cached?.actorId && Array.isArray(cached.rows)) {
-        actorId = cached.actorId;
-        rows = cached.rows;
-        notify("Copia local sin conexi\xF3n. Inicia sesi\xF3n con la misma cuenta al reconectar.");
-      } else notify("Entra con Microsoft para ver el registro de prueba.");
+      notify("Entra con Microsoft para abrir Tetl.");
       return;
     }
     msal.setActiveAccount(account);
     graph = new GraphPilot(config, token);
-    if (config.driveId && config.catalogPath && config.mediaRoot) {
-      files = new GraphPrivateFiles(config, token);
-      try {
-        catalog = await files.catalog();
-        catalogById = new Map(catalog.map((ad) => [ad.ad_id, ad]));
-      } catch (error) {
-        notify("No se pudo cargar el cat\xE1logo privado: " + String(error.message || error));
-        return;
-      }
+    if (!config.driveId || !config.catalogPath || !config.mediaRoot) {
+      notify("El cat\xE1logo privado a\xFAn no est\xE1 configurado.");
+      return;
+    }
+    files = new GraphPrivateFiles(config, token);
+    try {
+      catalog = await files.catalog();
+      catalogById = new Map(catalog.map((ad) => [ad.ad_id, ad]));
+    } catch (_) {
+      notify("No se pudo confirmar el acceso al cat\xE1logo privado. Reintenta al reconectar.");
+      return;
     }
     if (cached?.homeAccountId === account.homeAccountId && cached.actorId && Array.isArray(cached.rows)) {
       actorId = cached.actorId;
       rows = cached.rows;
       notify("Mostrando la copia local. Pulsa Sincronizar para confirmar con SharePoint.");
     }
-    await sync();
+    if (await sync()) accessConfirmed = true;
   }
   function actors(allRows) {
     const names = /* @__PURE__ */ new Map();
@@ -16107,6 +16144,7 @@ ${serverError}`);
   }
   async function api(path, body) {
     await ready;
+    if (!accessConfirmed) throw Error("Entra con Microsoft para abrir Tetl");
     if (path === "/api/state") {
       const projection = await projected();
       return {
@@ -16148,10 +16186,14 @@ ${serverError}`);
       return { sync: {}, inbox: {}, error: null };
     }
     if (path === "/api/logout") {
-      if (msal && account) await msal.logoutRedirect({
-        account,
-        postLogoutRedirectUri: location.origin + location.pathname
-      });
+      if (msal && account) {
+        const signingOut = account;
+        lock("Cerrando sesi\xF3n\u2026");
+        await msal.logoutRedirect({
+          account: signingOut,
+          postLogoutRedirectUri: location.origin + location.pathname
+        });
+      }
       return {};
     }
     let match = /^\/api\/(?:listing|person)\/([^/]+)(\/person)?$/.exec(path);
@@ -16172,10 +16214,11 @@ ${serverError}`);
   async function sync() {
     if (DEMO) {
       notify("Demostraci\xF3n local: no hay conexi\xF3n con SharePoint.");
-      return;
+      return true;
     }
-    if (!graph || !account || busy) return;
+    if (!graph || !account || busy) return false;
     busy = true;
+    let accessReady = false;
     notify("Sincronizando con SharePoint\u2026");
     try {
       const signedActor = await graph.currentUser();
@@ -16227,12 +16270,16 @@ ${serverError}`);
       const confirmed = items.filter((item) => status(item) === "accepted").length;
       const conflicts = items.filter((item) => status(item) && status(item) !== "accepted").length;
       notify(pending ? pending + " cambio(s) pendientes en este dispositivo." : "SharePoint confirm\xF3 los cambios." + (confirmed ? " " + confirmed + " cambio(s) recibido(s)." : "") + (conflicts ? " " + conflicts + " conflicto(s) por revisar." : ""));
+      accessReady = true;
     } catch (error) {
-      notify("Sin conexi\xF3n o sin acceso: " + String(error?.message || error));
+      if (error?.status === 401 || error?.status === 403)
+        lock("La sesi\xF3n o el acceso a Tetl termin\xF3. Entra con Microsoft para continuar.");
+      else notify("Sin conexi\xF3n o sin acceso: " + String(error?.message || error));
     } finally {
       busy = false;
       pilot.refresh?.();
     }
+    return accessReady;
   }
   document.addEventListener("click", (event) => {
     if (event.target.closest("#pilot-signin")) {
@@ -16265,7 +16312,7 @@ ${serverError}`);
   }, true);
   window.addEventListener("online", () => {
     if (DEMO) return;
-    if (!graph) location.reload();
+    if (!graph || !accessConfirmed) location.reload();
     else sync();
   });
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js" + (ASSET_VERSION ? "?v=" + ASSET_VERSION : "")).catch(() => {

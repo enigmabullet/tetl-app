@@ -1,4 +1,4 @@
-const VERSION = 'cf6a91105a03';
+const VERSION = '5d53be1d5bf4';
 const CACHE = 'tetl-native-pilot-' + VERSION;
 const SHELL = ['./', ...['index.html', 'config.json', 'app.js', 'pilot-bridge.js', 'app.css',
   'pilot-ui.css', 'i18n.js', 'manifest.webmanifest', 'ui/icon-192.png', 'ui/icon-512.png',
@@ -13,5 +13,9 @@ self.addEventListener('fetch', event => {
   event.respondWith(fetch(request).then(response => {
     if (response.ok) { const copy = response.clone(); caches.open(CACHE).then(cache => cache.put(request, copy)); }
     return response;
-  }).catch(() => caches.match(request)));
+  }).catch(async () => {
+    const cached = await caches.match(request);
+    if (cached) return cached;
+    if (request.mode === 'navigate') return caches.match(new URL('./', self.location.href));
+  }));
 });
