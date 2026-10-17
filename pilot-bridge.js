@@ -15747,6 +15747,7 @@ ${serverError}`);
 
   // native-bridge.js
   var SCOPES = ["User.Read", "Sites.Selected"];
+  var ASSET_VERSION = new URL(document.currentScript?.src || location.href).searchParams.get("v") || "";
   var DEMO = new URL(location.href).searchParams.has("demo");
   var now = () => (/* @__PURE__ */ new Date()).toISOString();
   var safe = (value) => String(value ?? "").replace(
@@ -15858,7 +15859,7 @@ ${serverError}`);
     queue = await PilotQueue.open();
     cached = await queue.snapshot();
     try {
-      const response = await fetch("./config.json", { cache: "no-store" });
+      const response = await fetch("./config.json" + (ASSET_VERSION ? "?v=" + ASSET_VERSION : ""), { cache: "no-store" });
       if (!response.ok) throw Error("Pilot configuration unavailable");
       config = await response.json();
     } catch (_) {
@@ -16257,7 +16258,7 @@ ${serverError}`);
     if (!graph) location.reload();
     else sync();
   });
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(() => {
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js" + (ASSET_VERSION ? "?v=" + ASSET_VERSION : "")).catch(() => {
   });
 })();
 /*! Bundled license information:

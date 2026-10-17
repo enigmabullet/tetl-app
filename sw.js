@@ -1,8 +1,8 @@
-const CACHE = 'tetl-native-pilot-4';
-const SHELL = ['./', './index.html', './config.json', './app.js', './pilot-bridge.js', './app.css',
-  './pilot-ui.css',
-  './i18n.js', './manifest.webmanifest', './ui/icon-192.png', './ui/icon-512.png',
-  './vendor/leaflet/leaflet.js', './vendor/leaflet/leaflet.css'];
+const VERSION = '6d4378f0061b';
+const CACHE = 'tetl-native-pilot-' + VERSION;
+const SHELL = ['./', ...['index.html', 'config.json', 'app.js', 'pilot-bridge.js', 'app.css',
+  'pilot-ui.css', 'i18n.js', 'manifest.webmanifest', 'ui/icon-192.png', 'ui/icon-512.png',
+  'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css'].map(path => './' + path + '?v=' + VERSION)];
 self.addEventListener('install', event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))));
 self.addEventListener('activate', event => event.waitUntil(
   caches.keys().then(keys => Promise.all(keys.filter(key => key.startsWith('tetl-') && key !== CACHE)
