@@ -15343,7 +15343,7 @@ ${serverError}`);
   // graph.js
   var ROOT = "https://graph.microsoft.com/v1.0";
   var GraphPilot = class {
-    constructor(config2, token2, transport = fetch) {
+    constructor(config2, token2, transport = (...args) => globalThis.fetch(...args)) {
       if (!config2?.siteId || !config2?.journalListId) throw Error("Tetl site and journal configuration required");
       this.token = token2;
       this.transport = transport;
