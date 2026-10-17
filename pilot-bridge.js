@@ -15428,6 +15428,13 @@ ${serverError}`);
 
   // graph.js
   var ROOT = "https://graph.microsoft.com/v1.0";
+  function samePath(left, right) {
+    try {
+      return decodeURIComponent(left.pathname) === decodeURIComponent(right.pathname);
+    } catch (_) {
+      return false;
+    }
+  }
   var GraphPilot = class {
     constructor(config2, token2, transport = (...args) => globalThis.fetch(...args)) {
       if (!config2?.siteId || !config2?.journalListId) throw Error("Tetl site and journal configuration required");
@@ -15439,7 +15446,7 @@ ${serverError}`);
     async request(method, url, body) {
       const target = new URL(url);
       const base = new URL(this.base);
-      if (target.origin !== base.origin || target.username || target.password || target.hash || target.pathname !== base.pathname && !(method === "GET" && target.pathname === new URL(this.deltaBase).pathname))
+      if (target.origin !== base.origin || target.username || target.password || target.hash || !samePath(target, base) && !(method === "GET" && samePath(target, new URL(this.deltaBase))))
         throw Error("Unexpected Graph journal address");
       const headers = { Authorization: "Bearer " + await this.token(), Accept: "application/json" };
       if (body !== void 0) headers["Content-Type"] = "application/json";
@@ -15518,7 +15525,7 @@ ${serverError}`);
     }
     checkUrl(url, delta = false) {
       const target = new URL(url), expected = new URL(delta ? this.deltaBase : this.base);
-      if (target.origin !== expected.origin || target.pathname !== expected.pathname || target.username || target.password || target.hash)
+      if (target.origin !== expected.origin || !samePath(target, expected) || target.username || target.password || target.hash)
         throw Error("Unexpected Graph journal address");
     }
     async find(id) {
