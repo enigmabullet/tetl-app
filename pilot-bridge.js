@@ -15181,7 +15181,7 @@ ${serverError}`);
       raw: fields.PayloadJson
     };
   }
-  function replay(rows2, seedAds = []) {
+  function replay(rows2, seedAds = [], legacyActors = {}) {
     const ordered = rows2.map(serverRow).sort((a, b) => a.sequence - b.sequence);
     const seenSeq = /* @__PURE__ */ new Set(), seenIds = /* @__PURE__ */ new Set();
     const state = {
@@ -15204,6 +15204,16 @@ ${serverError}`);
         field_rev: {},
         url: seed.url || null
       };
+      const old = seed.legacy_responses || {};
+      if (typeof old !== "object" || Array.isArray(old)) throw Error("Invalid historical responses");
+      for (const [person, values] of Object.entries(old)) {
+        if (!FIELD_NAME.test(person) || !values || typeof values !== "object" || Array.isArray(values) || Object.keys(values).some((field) => !RESPONSE_FIELDS.has(field)) || values.rating != null && ![1, 2, 3, 4, 5].includes(values.rating))
+          throw Error("Invalid historical response");
+        const actor = legacyActors[person] || "legacy:" + person;
+        const key = JSON.stringify([seed.ad_id, actor]);
+        if (state.responses[key]) throw Error("Duplicate historical response");
+        state.responses[key] = { values: { ...values }, rev: {} };
+      }
     }
     const receipts = {};
     for (const row of ordered) {
@@ -15631,7 +15641,7 @@ ${serverError}`);
     }
     async catalog() {
       const data = await this.json(this.catalogPath);
-      if (data?.schema_version !== "tetl-browser-batch-1" || !Array.isArray(data.ads))
+      if (!["tetl-browser-batch-1", "tetl-browser-full-1"].includes(data?.schema_version) || !Array.isArray(data.ads))
         throw Error("Private Tetl catalog format is invalid");
       const ids = /* @__PURE__ */ new Set();
       for (const ad of data.ads) {
@@ -15639,7 +15649,9 @@ ${serverError}`);
         ids.add(ad.ad_id);
         for (const photo of ad.photos) pathParts(photo?.file);
       }
-      return data.ads;
+      if (data.people !== void 0 && (!Array.isArray(data.people) || data.people.some((person) => typeof person?.id !== "string" || typeof person.label !== "string" || typeof person.name_prefix !== "string")))
+        throw Error("Private Tetl catalog has invalid people");
+      return data;
     }
     async json(path) {
       return (await this.download(path)).json();
@@ -15760,6 +15772,48 @@ ${serverError}`);
     }
   };
 
+  // legacy-identity.js
+  function normalized(value) {
+    return typeof value === "string" ? value.normalize("NFKC").trim().toLocaleLowerCase() : "";
+  }
+  function legacyBindings(rows2, actorId2, accountName, people = []) {
+    const names = /* @__PURE__ */ new Map();
+    for (const row of rows2) {
+      const user = row?.createdBy?.user;
+      if (typeof user?.id === "string" && user.id) {
+        const value = user.displayName || "";
+        if (names.has(user.id) && names.get(user.id) !== value) names.set(user.id, "");
+        else if (!names.has(user.id)) names.set(user.id, value);
+      }
+    }
+    if (actorId2 && accountName) names.set(actorId2, accountName);
+    const result = {};
+    for (const person of people) {
+      if (typeof person?.id !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(person.id) || typeof person.label !== "string" || !person.label || typeof person.name_prefix !== "string" || !person.name_prefix)
+        throw Error("Invalid private person identity");
+      const prefix = normalized(person.name_prefix);
+      const candidates = [...names].filter(([, name3]) => {
+        const value = normalized(name3);
+        return value === prefix || value.startsWith(prefix + " ");
+      });
+      result[person.id] = candidates.length === 1 ? candidates[0][0] : "legacy:" + person.id;
+    }
+    if (new Set(Object.values(result)).size !== Object.keys(result).length)
+      throw Error("Historical people resolved to one account");
+    return result;
+  }
+  function historicalPeople(bindings, rows2, actorId2, accountName, people = []) {
+    const named = /* @__PURE__ */ new Map();
+    for (const person of people)
+      named.set(bindings[person.id], person.label);
+    for (const row of rows2) {
+      const user = row?.createdBy?.user;
+      if (user?.id && !named.has(user.id)) named.set(user.id, user.displayName || user.id);
+    }
+    if (actorId2 && !named.has(actorId2)) named.set(actorId2, accountName || "Yo");
+    return [...named].map(([id, name3]) => ({ id, name: name3 }));
+  }
+
   // native-bridge.js
   var SCOPES = ["User.Read", "Sites.Selected"];
   var ASSET_VERSION = new URL(document.currentScript?.src || location.href).searchParams.get("v") || "";
@@ -15820,11 +15874,13 @@ ${serverError}`);
   var graph;
   var files;
   var catalog = null;
+  var catalogPeople = [];
   var catalogById = null;
   var msal;
   var account;
   var actorId = DEMO ? "demo-person-a" : null;
   var rows = DEMO ? DEMO_ROWS : [];
+  var cardObserver = null;
   var stateText = DEMO ? "Demostraci\xF3n: datos sint\xE9ticos. Los cambios s\xF3lo duran hasta recargar." : "Preparando el cat\xE1logo privado de Tetl\u2026";
   var busy = false;
   var config = null;
@@ -15839,6 +15895,8 @@ ${serverError}`);
     refresh: null,
     renderMedia: null,
     photoUrl,
+    observeCards,
+    popupPhoto,
     controls,
     fixedSearches,
     searchForm,
@@ -15849,9 +15907,12 @@ ${serverError}`);
   function lock(message) {
     accessConfirmed = false;
     document.documentElement.classList.remove("tetl-authenticated");
+    cardObserver?.disconnect();
+    cardObserver = null;
     files?.dispose();
     files = null;
     catalog = null;
+    catalogPeople = [];
     catalogById = null;
     rows = [];
     actorId = null;
@@ -15944,7 +16005,9 @@ ${serverError}`);
     }
     files = new GraphPrivateFiles(config, token);
     try {
-      catalog = await files.catalog();
+      const privateCatalog = await files.catalog();
+      catalog = privateCatalog.ads;
+      catalogPeople = privateCatalog.people || [];
       catalogById = new Map(catalog.map((ad) => [ad.ad_id, ad]));
     } catch (_) {
       notify("No se pudo confirmar el acceso al cat\xE1logo privado. Reintenta al reconectar.");
@@ -15958,6 +16021,10 @@ ${serverError}`);
     if (await sync()) accessConfirmed = true;
   }
   function actors(allRows) {
+    if (!DEMO) {
+      const bindings = legacyBindings(allRows, actorId, account?.name, catalogPeople);
+      return historicalPeople(bindings, allRows, actorId, account?.name, catalogPeople);
+    }
     const names = /* @__PURE__ */ new Map();
     for (const row of allRows) {
       const user = row.createdBy?.user;
@@ -15984,7 +16051,8 @@ ${serverError}`);
         });
       }
     }
-    return { all, ...replay(all, catalog || []) };
+    const bindings = DEMO ? {} : legacyBindings(all, actorId, account?.name, catalogPeople);
+    return { all, ...replay(all, catalog || [], bindings) };
   }
   function photoUrl(listing, index) {
     const photo = listing?.photos?.[index];
@@ -15993,6 +16061,46 @@ ${serverError}`);
       photo.file,
       () => pilot.renderMedia?.()
     ) : null;
+  }
+  function fillCardPhoto(key) {
+    const listing = knownListings.find((item) => item.key === key);
+    const photo = listing?.photos?.[0];
+    if (!files || !photo?.file) return;
+    const url = files.photoUrl(key, photo.file, () => fillCardPhoto(key));
+    if (url) for (const image of document.querySelectorAll("img[data-tetl-card-photo]")) {
+      if (image.dataset.tetlCardPhoto === key) image.src = url;
+    }
+  }
+  function observeCards(root) {
+    cardObserver?.disconnect();
+    const images = [...root.querySelectorAll("img[data-tetl-card-photo]")];
+    if (typeof IntersectionObserver !== "function") {
+      images.slice(0, 24).forEach((image) => fillCardPhoto(image.dataset.tetlCardPhoto));
+      return;
+    }
+    cardObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        cardObserver?.unobserve(entry.target);
+        fillCardPhoto(entry.target.dataset.tetlCardPhoto);
+      }
+    }, { rootMargin: "400px 0px" });
+    images.forEach((image) => cardObserver.observe(image));
+  }
+  function popupPhoto(listing, marker) {
+    const photo = listing?.photos?.[0];
+    if (!files || !photo?.file) return;
+    const show = () => {
+      const url = files?.photoUrl(listing.key, photo.file, show);
+      const card = marker.getPopup()?.getElement()?.querySelector(".popcard");
+      if (url && card && !card.querySelector("img")) {
+        const image = document.createElement("img");
+        image.src = url;
+        image.alt = "";
+        card.prepend(image);
+      }
+    };
+    show();
   }
   async function fixedSearches() {
     if (DEMO) return { types: [], areas: [], ranchos: [], i24_all: null };
@@ -16033,7 +16141,7 @@ ${serverError}`);
       photos: f.photos || catalogById?.get(ad.ad_id)?.photos || [],
       photo_sources: [],
       pending: [],
-      history: [],
+      history: catalogById?.get(ad.ad_id)?.history || [],
       amenities: f.amenities || [],
       archived: !!f.archived,
       dupes: members(projection.state, ad.ad_id).filter((id) => id !== ad.ad_id)
