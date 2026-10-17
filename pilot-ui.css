@@ -1,0 +1,5 @@
+/* Compact listing facts in the development pilot. The released UI is unchanged. */
+.d-main .kv { margin: 8px 0 12px; }
+.d-main .kv > div { padding: 5px 8px; }
+.d-main .kv .k { font-size: 10px; line-height: 1.2; }
+.d-main .kv .v { margin-top: 1px; font-size: 13px; line-height: 1.3; }
