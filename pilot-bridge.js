@@ -15143,9 +15143,22 @@ ${serverError}`);
   };
 
   // core.js
-  var KINDS = /* @__PURE__ */ new Set(["upsert_ad", "resave_ad", "set_field", "respond", "decide_match", "delete", "restore"]);
+  var KINDS = /* @__PURE__ */ new Set([
+    "upsert_ad",
+    "resave_ad",
+    "set_field",
+    "respond",
+    "decide_match",
+    "delete",
+    "restore",
+    "search_save",
+    "search_archive",
+    "capture_request",
+    "capture_result",
+    "search_result"
+  ]);
   var RESPONSE_FIELDS = /* @__PURE__ */ new Set(["saved", "rating", "comment", "my_status", "seen_at"]);
-  var clone = (value) => structuredClone(value);
+  var FIELD_NAME = /^[a-z][a-z0-9_]{0,63}$/;
   function canonical(payload) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw Error("Operation payload must be an object");
     const sort = (value) => Array.isArray(value) ? value.map(sort) : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((k) => [k, sort(value[k])])) : value;
@@ -15168,10 +15181,30 @@ ${serverError}`);
       raw: fields.PayloadJson
     };
   }
-  function replay(rows2) {
+  function replay(rows2, seedAds = []) {
     const ordered = rows2.map(serverRow).sort((a, b) => a.sequence - b.sequence);
     const seenSeq = /* @__PURE__ */ new Set(), seenIds = /* @__PURE__ */ new Set();
-    const state = { ads: {}, responses: {}, decisions: {}, deletions: {}, conflicts: [], revision: 0 };
+    const state = {
+      ads: {},
+      responses: {},
+      decisions: {},
+      deletions: {},
+      searches: {},
+      captureRequests: {},
+      conflicts: [],
+      revision: 0
+    };
+    for (const seed of seedAds) {
+      if (!seed || typeof seed.ad_id !== "string" || !/^[a-z][a-z0-9_]*-[A-Za-z0-9_-]+$/.test(seed.ad_id) || !seed.fields || typeof seed.fields !== "object" || Array.isArray(seed.fields) || Object.keys(seed.fields).some((key) => !FIELD_NAME.test(key)) || state.ads[seed.ad_id]) throw Error("Invalid private catalog ad");
+      state.ads[seed.ad_id] = {
+        ad_id: seed.ad_id,
+        fields: { ...seed.fields },
+        source_fields: { ...seed.fields },
+        manual_fields: {},
+        field_rev: {},
+        url: seed.url || null
+      };
+    }
     const receipts = {};
     for (const row of ordered) {
       if (seenSeq.has(row.sequence) || seenIds.has(row.id)) throw Error("Duplicate journal row or operation ID");
@@ -15182,10 +15215,8 @@ ${serverError}`);
         if (!KINDS.has(row.kind)) throw Error("unsupported operation kind");
         const payload = JSON.parse(row.raw);
         if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw Error("invalid payload");
-        const next = clone(state);
-        result = apply(next, row, payload);
-        if (result.status !== "rejected") next.revision++;
-        Object.assign(state, next);
+        result = apply(state, row, payload);
+        if (result.status !== "rejected") state.revision++;
       } catch (_) {
         result = { status: "rejected", reason: "invalid operation" };
       }
@@ -15201,6 +15232,53 @@ ${serverError}`);
   }
   function apply(s, row, p) {
     const id = p.ad_id;
+    if (row.kind === "search_save") {
+      if (typeof p.search_id !== "string" || !/^[a-f0-9-]{16,64}$/i.test(p.search_id) || typeof p.name !== "string" || !p.name.trim() || p.name.length > 160 || !validUrl(p.url) || s.searches[p.search_id])
+        return { status: "rejected", reason: "invalid or duplicate search" };
+      s.searches[p.search_id] = {
+        id: p.search_id,
+        name: p.name.trim(),
+        url: p.url,
+        archived: false,
+        actor: row.actor,
+        created_at: row.created,
+        pc_status: "pending"
+      };
+      return { status: "accepted", search_id: p.search_id };
+    }
+    if (row.kind === "search_archive") {
+      const search = s.searches[p.search_id];
+      if (!search) return { status: "rejected", reason: "search unavailable" };
+      search.archived = true;
+      return { status: "accepted" };
+    }
+    if (row.kind === "search_result") {
+      const search = s.searches[p.search_id];
+      if (!search) return { status: "rejected", reason: "search unavailable" };
+      if (!["forwarded", "failed"].includes(p.status)) throw Error("invalid search result");
+      search.pc_status = p.status;
+      if (typeof p.pc_id === "string") search.pc_id = p.pc_id;
+      return { status: "accepted" };
+    }
+    if (row.kind === "capture_request") {
+      if (!Array.isArray(p.urls) || !p.urls.length || p.urls.length > 50 || p.urls.some((url) => !validUrl(url)))
+        return { status: "rejected", reason: "invalid capture URLs" };
+      s.captureRequests[row.id] = {
+        id: row.id,
+        urls: [...new Set(p.urls)],
+        created_at: row.created,
+        status: "pending"
+      };
+      return { status: "accepted", request_id: row.id };
+    }
+    if (row.kind === "capture_result") {
+      const request = s.captureRequests[p.request_id];
+      if (!request) return { status: "rejected", reason: "capture request unavailable" };
+      if (!["forwarded", "failed"].includes(p.status)) throw Error("invalid capture result");
+      request.status = p.status;
+      request.count = Number(p.count) || 0;
+      return { status: "accepted" };
+    }
     if (row.kind === "upsert_ad" || row.kind === "resave_ad") {
       if (typeof id !== "string" || !/^[a-z][a-z0-9_]*-[A-Za-z0-9_-]+$/.test(id)) throw Error("invalid ad");
       if (s.ads[id]?.purged && row.kind !== "resave_ad") return { status: "rejected", reason: "purged identity" };
@@ -15210,7 +15288,7 @@ ${serverError}`);
       if (row.kind === "resave_ad" && !ad.purged) return { status: "rejected", reason: "explicit resave required" };
       delete ad.purged;
       const fields = p.fields || {};
-      if (typeof fields !== "object" || Array.isArray(fields)) throw Error("invalid fields");
+      if (typeof fields !== "object" || Array.isArray(fields) || Object.keys(fields).some((key) => !FIELD_NAME.test(key))) throw Error("invalid fields");
       for (const [key, value] of Object.entries(fields)) {
         ad.source_fields[key] = value;
         if (!Object.hasOwn(ad.manual_fields, key)) {
@@ -15226,7 +15304,7 @@ ${serverError}`);
       const ad = s.ads[id];
       if (!ad || !visible(s, id)) return { status: "rejected", reason: "advertisement unavailable" };
       const field = p.field;
-      if (typeof field !== "string" || !field) throw Error("invalid field");
+      if (typeof field !== "string" || !FIELD_NAME.test(field)) throw Error("invalid field");
       if ((ad.field_rev[field] || 0) > Number(p.base_field_rev || 0)) {
         const conflict = {
           op_id: row.id,
@@ -15319,6 +15397,14 @@ ${serverError}`);
     }
     throw Error("unsupported operation");
   }
+  function validUrl(value) {
+    if (typeof value !== "string" || value.length > 4096) return false;
+    try {
+      return ["http:", "https:"].includes(new URL(value).protocol);
+    } catch (_) {
+      return false;
+    }
+  }
   function members(s, id) {
     const connected = /* @__PURE__ */ new Set([id]);
     let changed;
@@ -15348,11 +15434,12 @@ ${serverError}`);
       this.token = token2;
       this.transport = transport;
       this.base = ROOT + "/sites/" + encodeURIComponent(config2.siteId) + "/lists/" + encodeURIComponent(config2.journalListId) + "/items";
+      this.deltaBase = this.base + "/delta";
     }
     async request(method, url, body) {
       const target = new URL(url);
       const base = new URL(this.base);
-      if (target.origin !== base.origin || target.pathname !== base.pathname || target.hash)
+      if (target.origin !== base.origin || target.username || target.password || target.hash || target.pathname !== base.pathname && !(method === "GET" && target.pathname === new URL(this.deltaBase).pathname))
         throw Error("Unexpected Graph journal address");
       const headers = { Authorization: "Bearer " + await this.token(), Accept: "application/json" };
       if (body !== void 0) headers["Content-Type"] = "application/json";
@@ -15366,7 +15453,11 @@ ${serverError}`);
       } catch (_) {
         throw Error("Microsoft Graph is unreachable");
       }
-      if (!response.ok) throw Error("Microsoft Graph returned HTTP " + response.status);
+      if (!response.ok) {
+        const error = Error("Microsoft Graph returned HTTP " + response.status);
+        error.status = response.status;
+        throw error;
+      }
       const data = await response.json();
       if (!data || typeof data !== "object") throw Error("Invalid Graph response");
       return data;
@@ -15390,6 +15481,45 @@ ${serverError}`);
     }
     items() {
       return this.all(this.base + "?$expand=fields");
+    }
+    async changes(cursor = null, prior = []) {
+      if (!Array.isArray(prior)) throw Error("Cached journal rows are invalid");
+      const rows2 = new Map((cursor ? prior : []).map((row) => [row.id, row]));
+      let next = cursor || this.deltaBase + "?$expand=fields";
+      const seenPages = /* @__PURE__ */ new Set();
+      while (next) {
+        if (seenPages.has(next) || seenPages.size >= 1e3) throw Error("Journal delta did not finish");
+        seenPages.add(next);
+        const data = await this.request("GET", next);
+        if (!Array.isArray(data.value)) throw Error("Journal delta page missing rows");
+        for (const row of data.value) {
+          if (!row || typeof row.id !== "string" || !row.id)
+            throw Error("Journal delta item has no ID");
+          if (row["@removed"]) rows2.delete(row.id);
+          else {
+            if (!row.fields) throw Error("Journal delta item has no fields");
+            rows2.set(row.id, row);
+          }
+        }
+        const pageNext = data["@odata.nextLink"];
+        const deltaLink = data["@odata.deltaLink"];
+        if (!!pageNext === !!deltaLink) throw Error("Journal delta page has no unique cursor");
+        if (deltaLink) {
+          this.checkUrl(deltaLink, true);
+          return {
+            rows: [...rows2.values()].sort((a, b) => Number(a.id) - Number(b.id)),
+            deltaLink
+          };
+        }
+        this.checkUrl(pageNext, true);
+        next = pageNext;
+      }
+      throw Error("Journal delta did not finish");
+    }
+    checkUrl(url, delta = false) {
+      const target = new URL(url), expected = new URL(delta ? this.deltaBase : this.base);
+      if (target.origin !== expected.origin || target.pathname !== expected.pathname || target.username || target.password || target.hash)
+        throw Error("Unexpected Graph journal address");
     }
     async find(id) {
       const filter = "fields/OperationId eq '" + id.replaceAll("'", "''") + "'";
@@ -15416,7 +15546,7 @@ ${serverError}`);
         throw Error("Operation ID belongs to different content or actor");
       return row;
     }
-    async submit(id, kind, payload) {
+    async stage(id, kind, payload) {
       if (!/^[a-f0-9-]{16,64}$/i.test(id)) throw Error("Invalid operation ID");
       const raw = canonical(payload);
       const actor = await this.currentUser();
@@ -15435,11 +15565,93 @@ ${serverError}`);
         row ||= await this.find(id);
       }
       this.check(row, id, kind, raw, actor);
+      return row;
+    }
+    async submit(id, kind, payload) {
+      const row = await this.stage(id, kind, payload);
+      const actor = row.createdBy.user.id;
       const rows2 = await this.items();
       const projection = replay(rows2);
       const receipt = projection.receipts[id];
       if (!receipt || receipt.submitted_by !== actor) throw Error("Committed receipt was unavailable");
       return { rows: rows2, projection, receipt };
+    }
+  };
+
+  // private-files.js
+  var GRAPH = "https://graph.microsoft.com/v1.0";
+  function pathParts(path) {
+    if (typeof path !== "string") throw Error("Private file path is missing");
+    const parts = path.split("/");
+    if (!parts.length || parts.some((part) => !part || part === "." || part === ".." || /[\\?#:]/.test(part)))
+      throw Error("Invalid private file path");
+    return parts;
+  }
+  var GraphPrivateFiles = class {
+    constructor(config2, token2, transport = (...args) => globalThis.fetch(...args)) {
+      if (!config2?.driveId || !config2?.catalogPath || !config2?.mediaRoot)
+        throw Error("Private catalog configuration is incomplete");
+      pathParts(config2.catalogPath);
+      pathParts(config2.mediaRoot);
+      this.root = GRAPH + "/drives/" + encodeURIComponent(config2.driveId) + "/root:";
+      this.catalogPath = config2.catalogPath;
+      this.mediaRoot = config2.mediaRoot;
+      this.token = token2;
+      this.transport = transport;
+      this.images = /* @__PURE__ */ new Map();
+      this.loading = /* @__PURE__ */ new Map();
+    }
+    async download(path) {
+      const parts = pathParts(path);
+      const url = this.root + "/" + parts.map(encodeURIComponent).join("/");
+      const meta = await this.transport(url, { headers: {
+        Authorization: "Bearer " + await this.token(),
+        Accept: "application/json"
+      } });
+      if (!meta.ok) throw Error("Private SharePoint file returned HTTP " + meta.status);
+      const item = await meta.json();
+      const downloadUrl = item?.["@microsoft.graph.downloadUrl"];
+      if (!item?.file || typeof downloadUrl !== "string" || new URL(downloadUrl).protocol !== "https:")
+        throw Error("SharePoint did not provide a private file download");
+      const data = await this.transport(downloadUrl);
+      if (!data.ok) throw Error("Private file download returned HTTP " + data.status);
+      return data;
+    }
+    async catalog() {
+      const data = await this.json(this.catalogPath);
+      if (data?.schema_version !== "tetl-browser-batch-1" || !Array.isArray(data.ads))
+        throw Error("Private Tetl catalog format is invalid");
+      const ids = /* @__PURE__ */ new Set();
+      for (const ad of data.ads) {
+        if (typeof ad?.ad_id !== "string" || ids.has(ad.ad_id) || !ad.fields || typeof ad.fields !== "object" || Array.isArray(ad.fields) || !Array.isArray(ad.photos)) throw Error("Private Tetl catalog has an invalid ad");
+        ids.add(ad.ad_id);
+        for (const photo of ad.photos) pathParts(photo?.file);
+      }
+      return data.ads;
+    }
+    async json(path) {
+      return (await this.download(path)).json();
+    }
+    photoUrl(adId, file, onReady) {
+      const key = adId + "/" + file;
+      if (this.images.has(key)) return this.images.get(key);
+      if (!this.loading.has(key)) {
+        pathParts(adId);
+        pathParts(file);
+        const path = this.mediaRoot + "/" + key;
+        const task = this.download(path).then((response) => response.blob()).then((blob) => {
+          if (!blob.type.startsWith("image/")) throw Error("Private media is not an image");
+          this.images.set(key, URL.createObjectURL(blob));
+          onReady?.();
+        }).catch(() => {
+        }).finally(() => this.loading.delete(key));
+        this.loading.set(key, task);
+      }
+      return null;
+    }
+    dispose() {
+      for (const url of this.images.values()) URL.revokeObjectURL(url);
+      this.images.clear();
     }
   };
 
@@ -15590,15 +15802,30 @@ ${serverError}`);
   ];
   var queue;
   var graph;
+  var files;
+  var catalog = null;
+  var catalogById = null;
   var msal;
   var account;
   var actorId = DEMO ? "demo-person-a" : null;
   var rows = DEMO ? DEMO_ROWS : [];
-  var stateText = DEMO ? "Demostraci\xF3n: datos sint\xE9ticos. Los cambios s\xF3lo duran hasta recargar." : "Preparando el piloto privado de Tetl\u2026";
+  var stateText = DEMO ? "Demostraci\xF3n: datos sint\xE9ticos. Los cambios s\xF3lo duran hasta recargar." : "Preparando el cat\xE1logo privado de Tetl\u2026";
   var busy = false;
   var config = null;
   var cached = null;
-  var pilot = window.TETL_PILOT = { api, banner, refresh: null, sync };
+  var knownListings = [];
+  var recoverable = [];
+  var pilot = window.TETL_PILOT = {
+    api,
+    banner,
+    refresh: null,
+    renderMedia: null,
+    photoUrl,
+    controls,
+    fixedSearches,
+    searchForm,
+    sync
+  };
   var ready = initialize();
   function notify(message) {
     stateText = message;
@@ -15614,7 +15841,8 @@ ${serverError}`);
   }
   function banner() {
     const button = !DEMO && config && !account ? ' <button class="btn small primary" id="pilot-signin">Entrar con Microsoft</button>' : "";
-    return '<div class="bar info"><b>Tetl \xB7 piloto privado</b> \xB7 ' + safe(stateText) + button + "</div>";
+    const restores = recoverable.length ? ' <select id="pilot-restore-id">' + recoverable.map((item) => '<option value="' + safe(item.id) + '">' + safe(item.label) + "</option>").join("") + '</select> <button class="btn small" data-act="pilot-restore">Recuperar</button>' : "";
+    return '<div class="bar info"><b>Tetl \xB7 prototipo privado</b> \xB7 ' + safe(stateText) + button + restores + "</div>";
   }
   async function token() {
     if (!account) throw Error("Entra con tu cuenta de Microsoft");
@@ -15643,9 +15871,9 @@ ${serverError}`);
       notify("No se pudo cargar la configuraci\xF3n del piloto. Recarga la p\xE1gina al reconectar.");
       return;
     }
-    if (!["clientId", "tenantId", "siteId", "journalListId"].every((key) => config[key]) || config.syntheticPilot !== true) {
+    if (!["clientId", "tenantId", "siteId", "journalListId"].every((key) => config[key]) || config.privatePrototype !== true) {
       config = null;
-      notify("El piloto web a\xFAn no tiene configuraci\xF3n de Microsoft. Vista local sin datos.");
+      notify("El prototipo web a\xFAn no tiene configuraci\xF3n de Microsoft. Vista local sin datos.");
       return;
     }
     msal = new PublicClientApplication({ auth: {
@@ -15667,6 +15895,16 @@ ${serverError}`);
     }
     msal.setActiveAccount(account);
     graph = new GraphPilot(config, token);
+    if (config.driveId && config.catalogPath && config.mediaRoot) {
+      files = new GraphPrivateFiles(config, token);
+      try {
+        catalog = await files.catalog();
+        catalogById = new Map(catalog.map((ad) => [ad.ad_id, ad]));
+      } catch (error) {
+        notify("No se pudo cargar el cat\xE1logo privado: " + String(error.message || error));
+        return;
+      }
+    }
     if (cached?.homeAccountId === account.homeAccountId && cached.actorId && Array.isArray(cached.rows)) {
       actorId = cached.actorId;
       rows = cached.rows;
@@ -15687,7 +15925,7 @@ ${serverError}`);
     const all = [...rows];
     if (!DEMO && queue && actorId) {
       const present = new Set(all.map((row) => row.fields?.OperationId));
-      let seq = Math.max(0, ...all.map((row) => Number(row.id) || 0));
+      let seq = all.reduce((max, row) => Math.max(max, Number(row.id) || 0), 0);
       for (const item of (await queue.all()).sort((a, b) => a.queuedAt.localeCompare(b.queuedAt))) {
         if (item.actorId !== actorId || present.has(item.id) || item.receipt) continue;
         all.push({
@@ -15701,7 +15939,28 @@ ${serverError}`);
         });
       }
     }
-    return { all, ...replay(all) };
+    return { all, ...replay(all, catalog || []) };
+  }
+  function photoUrl(listing, index) {
+    const photo = listing?.photos?.[index];
+    return files && photo?.file ? files.photoUrl(
+      listing.key,
+      photo.file,
+      () => pilot.renderMedia?.()
+    ) : null;
+  }
+  async function fixedSearches() {
+    if (DEMO) return { types: [], areas: [], ranchos: [], i24_all: null };
+    if (!files || !config.fixedSearchesPath) throw Error("B\xFAsquedas privadas no disponibles");
+    return files.json(config.fixedSearchesPath);
+  }
+  function searchForm() {
+    return '<div class="pilot-actions"><h4>B\xFAsqueda guardada</h4><input id="s-name" class="f-input" placeholder="Nombre" aria-label="Nombre de b\xFAsqueda"> <input id="s-url" class="f-input" placeholder="https://\u2026" aria-label="Enlace de b\xFAsqueda"> <button class="btn small" data-act="s-add">Guardar</button></div>';
+  }
+  function controls(listing) {
+    if (!DEMO && !catalogById?.has(listing.key) && listing.tetl_prototype !== true) return "";
+    const choices = knownListings.filter((item) => item.key !== listing.key);
+    return '<div class="pilot-actions"><h4>Propiedad y recuperaci\xF3n</h4>' + (choices.length ? '<select id="pilot-match-target" aria-label="Otro anuncio">' + choices.map((item) => '<option value="' + safe(item.key) + '">' + safe(item.title) + "</option>").join("") + '</select><p><button class="btn small" data-act="pilot-match" data-choice="same">Misma propiedad</button> <button class="btn small" data-act="pilot-match" data-choice="different">Distinta</button> <button class="btn small" data-act="pilot-match" data-choice="unsure">No s\xE9</button></p>' : "") + '<button class="btn small" data-act="pilot-delete" data-key="' + safe(listing.key) + '">Eliminar \xB7 recuperable 7 d\xEDas</button></div>';
   }
   function asListing(ad, projection, people) {
     const f = ad.fields || {};
@@ -15726,17 +15985,21 @@ ${serverError}`);
       added_by: people[0]?.id || actorId,
       captured_at: f.captured_at || "2026-10-16T21:36:10Z",
       updated_at: f.updated_at || "2026-10-17T13:00:00Z",
-      photos: [],
+      photos: f.photos || catalogById?.get(ad.ad_id)?.photos || [],
       photo_sources: [],
       pending: [],
       history: [],
-      amenities: []
+      amenities: f.amenities || [],
+      archived: !!f.archived,
+      dupes: members(projection.state, ad.ad_id).filter((id) => id !== ad.ad_id)
     };
   }
   async function listings() {
     const projection = await projected();
     const people = actors(projection.all);
-    return Object.values(projection.state.ads).filter((ad) => visible(projection.state, ad.ad_id)).map((ad) => asListing(ad, projection, people));
+    recoverable = Object.entries(projection.state.deletions).filter(([, deletion]) => deletion.status === "recoverable").map(([id, deletion]) => ({ id, label: deletion.ad_ids.map((adId) => projection.state.ads[adId]?.fields?.title || adId).join(", ") }));
+    knownListings = Object.values(projection.state.ads).filter((ad) => visible(projection.state, ad.ad_id) && (!catalogById || catalogById.has(ad.ad_id) || ad.fields.tetl_prototype === true)).map((ad) => asListing(ad, projection, people));
+    return knownListings;
   }
   async function writeResponse(key, values) {
     if (!actorId) throw Error("La cuenta a\xFAn no est\xE1 identificada");
@@ -15757,28 +16020,82 @@ ${serverError}`);
     }
     return (await listings()).find((item) => item.key === key);
   }
-  async function writeSharedStatus(key, status) {
-    if (!["nuevo", "interesa", "visitado", "descartado"].includes(status))
-      throw Error("Estado no reconocido");
+  async function queueOperation(kind, payload, syncNow = true) {
+    if (!actorId) throw Error("La cuenta a\xFAn no est\xE1 identificada");
+    if (DEMO) {
+      const id2 = "demo-" + crypto.randomUUID();
+      rows.push(demoRow(rows.length + 1, id2, kind, payload, actorId, now()));
+      notify("Cambio de demostraci\xF3n aplicado s\xF3lo en este navegador.");
+      return id2;
+    }
+    const id = await queue.enqueue(kind, payload, actorId);
+    notify("Cambio pendiente de confirmar con SharePoint.");
+    if (syncNow && navigator.onLine) sync().catch(() => {
+    });
+    return id;
+  }
+  async function writeFields(key, patch) {
+    if (!patch || typeof patch !== "object" || Array.isArray(patch) || !Object.keys(patch).length || Object.keys(patch).length > 24)
+      throw Error("Edici\xF3n no v\xE1lida");
     const projection = await projected();
     const ad = projection.state.ads[key];
     if (!ad || !visible(projection.state, key)) throw Error("El anuncio ya no est\xE1 disponible");
-    const payload = {
-      ad_id: key,
-      field: "my_status",
-      value: status,
-      base_field_rev: ad.field_rev.my_status || 0
-    };
-    if (DEMO) {
-      rows.push(demoRow(rows.length + 1, "demo-status-" + rows.length, "set_field", payload, actorId, now()));
-      notify("Estado de demostraci\xF3n aplicado s\xF3lo en este navegador.");
+    for (const [field, value] of Object.entries(patch)) {
+      if (!/^[a-z][a-z0-9_]{0,63}$/.test(field) || ["photos", "photo_sources", "people", "key", "dupes", "tetl_prototype"].includes(field))
+        throw Error("Campo no editable");
+      await queueOperation("set_field", {
+        ad_id: key,
+        field,
+        value,
+        base_field_rev: ad.field_rev[field] || 0
+      }, false);
+    }
+    if (!DEMO && navigator.onLine) sync().catch(() => {
+    });
+    return (await listings()).find((item) => item.key === key);
+  }
+  async function writeMatch(left, right, choice) {
+    const projection = await projected();
+    if (!visible(projection.state, left) || !visible(projection.state, right) || left === right || !["same", "different", "unsure"].includes(choice)) throw Error("Pareja no v\xE1lida");
+    const pair = [left, right].sort().join("|");
+    await queueOperation("decide_match", {
+      ad_ids: [left, right],
+      choice,
+      base_decision_rev: projection.state.decisions[pair]?.revision || 0
+    });
+    return { listings: await listings() };
+  }
+  async function deleteAd(key) {
+    const projection = await projected();
+    if (!visible(projection.state, key)) throw Error("El anuncio ya no est\xE1 disponible");
+    await queueOperation("delete", { ad_id: key, scope: "ad" });
+    return { listings: await listings() };
+  }
+  async function restoreAd(deleteId) {
+    const projection = await projected();
+    if (projection.state.deletions[deleteId]?.status !== "recoverable")
+      throw Error("La eliminaci\xF3n no es recuperable");
+    await queueOperation("restore", { delete_id: deleteId });
+    return { listings: await listings() };
+  }
+  async function saveSearch(body) {
+    if (body.archive) {
+      await queueOperation("search_archive", { search_id: body.archive });
     } else {
-      await queue.enqueue("set_field", payload, actorId);
-      notify("Estado guardado en este dispositivo; pendiente de confirmar con SharePoint.");
-      if (navigator.onLine) sync().catch(() => {
+      if (!body.name || !body.url) throw Error("Nombre y enlace necesarios");
+      await queueOperation("search_save", {
+        search_id: crypto.randomUUID(),
+        name: String(body.name).trim(),
+        url: String(body.url).trim()
       });
     }
-    return (await listings()).find((item) => item.key === key);
+    return { searches: Object.values((await projected()).state.searches).filter((item) => !item.archived) };
+  }
+  async function addCaptureUrls(body) {
+    const urls = [...new Set((body.urls || []).map((url) => String(url).trim()).filter(Boolean))];
+    if (!urls.length || urls.length > 50) throw Error("Selecciona de 1 a 50 enlaces");
+    await queueOperation("capture_request", { urls });
+    return { added: urls.length };
   }
   async function api(path, body) {
     await ready;
@@ -15799,8 +16116,24 @@ ${serverError}`);
       };
     }
     if (path === "/api/listings") return { listings: await listings() };
-    if (path === "/api/queue") return { queue: [] };
-    if (path === "/api/searches") return { searches: [] };
+    if (path === "/api/queue") {
+      if (body !== void 0) return addCaptureUrls(body);
+      const requests = Object.values((await projected()).state.captureRequests);
+      return { queue: requests.flatMap((item) => item.urls.map((url, index) => ({
+        id: item.id + ":" + index,
+        url,
+        site: new URL(url).hostname,
+        state: item.status,
+        captured_key: null
+      }))) };
+    }
+    if (path === "/api/searches") {
+      if (body !== void 0) return saveSearch(body);
+      return { searches: Object.values((await projected()).state.searches).filter((item) => !item.archived) };
+    }
+    if (path === "/api/match" && body) return writeMatch(body.left, body.right, body.choice);
+    if (path === "/api/delete" && body) return deleteAd(body.ad_id);
+    if (path === "/api/restore" && body) return restoreAd(body.delete_id);
     if (path === "/api/settings") return { ...body };
     if (path === "/api/sync") {
       await sync();
@@ -15821,9 +16154,9 @@ ${serverError}`);
       if (!record) throw Error("El anuncio ya no est\xE1 disponible");
       return record;
     }
-    if (!match[2] && path.startsWith("/api/listing/") && Object.keys(body.patch || {}).length === 1 && body.patch.my_status)
-      return writeSharedStatus(key, body.patch.my_status);
-    const values = match[2] ? body : path.startsWith("/api/person/") ? body.patch : body.patch;
+    if (!match[2] && path.startsWith("/api/listing/"))
+      return writeFields(key, body.patch);
+    const values = match[2] ? body : body.patch;
     if (!values || typeof values !== "object" || Array.isArray(values) || Object.keys(values).some((field) => !["saved", "rating", "comment", "my_status", "seen_at"].includes(field)))
       throw Error("Esta edici\xF3n no est\xE1 disponible en el piloto");
     return writeResponse(key, values);
@@ -15840,15 +16173,49 @@ ${serverError}`);
       const signedActor = await graph.currentUser();
       if (actorId && actorId !== signedActor) throw Error("Hay cambios de otra cuenta en este dispositivo");
       actorId = signedActor;
-      rows = await graph.items();
-      await queue.drain(graph, actorId);
-      rows = await graph.items();
-      await queue.snapshot({ rows, actorId, homeAccountId: account.homeAccountId });
+      const ownedCache = cached?.homeAccountId === account.homeAccountId && cached.actorId === actorId && cached.journalBase === graph.base ? cached : null;
+      let journal;
+      try {
+        journal = await graph.changes(ownedCache?.deltaLink, ownedCache?.rows || []);
+      } catch (error) {
+        if (error.status !== 410 || !ownedCache?.deltaLink) throw error;
+        journal = await graph.changes();
+      }
+      rows = journal.rows;
+      const waiting = (await queue.all()).filter((item) => !item.receipt).sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+      for (const item of waiting) {
+        if (item.actorId !== actorId) throw Error("Hay cambios de otra cuenta en este dispositivo");
+        await graph.stage(item.id, item.kind, JSON.parse(item.raw));
+      }
+      if (waiting.length) {
+        try {
+          journal = await graph.changes(journal.deltaLink, rows);
+        } catch (error) {
+          if (error.status !== 410) throw error;
+          journal = await graph.changes();
+        }
+        rows = journal.rows;
+        const receipts = replay(rows).receipts;
+        for (const item of waiting) {
+          const receipt = receipts[item.id];
+          if (!receipt || receipt.submitted_by !== actorId)
+            throw Error("SharePoint a\xFAn no devolvi\xF3 el cambio; vuelve a sincronizar");
+          await queue.saveReceipt(item.id, receipt);
+        }
+      }
+      cached = {
+        rows,
+        actorId,
+        homeAccountId: account.homeAccountId,
+        journalBase: graph.base,
+        deltaLink: journal.deltaLink
+      };
+      await queue.snapshot(cached);
       const items = await queue.all();
       const pending = items.filter((item) => !item.receipt).length;
       const confirmed = items.filter((item) => item.receipt?.result?.status === "accepted").length;
       const conflicts = items.filter((item) => item.receipt?.result?.status !== "accepted" && item.receipt).length;
-      notify(pending ? pending + " cambio(s) pendientes en este dispositivo." : "SharePoint confirm\xF3 el registro de prueba." + (confirmed ? " " + confirmed + " cambio(s) recibido(s)." : "") + (conflicts ? " " + conflicts + " conflicto(s) por revisar." : ""));
+      notify(pending ? pending + " cambio(s) pendientes en este dispositivo." : "SharePoint confirm\xF3 los cambios." + (confirmed ? " " + confirmed + " cambio(s) recibido(s)." : "") + (conflicts ? " " + conflicts + " conflicto(s) por revisar." : ""));
     } catch (error) {
       notify("Sin conexi\xF3n o sin acceso: " + String(error?.message || error));
     } finally {
@@ -15861,7 +16228,29 @@ ${serverError}`);
       event.preventDefault();
       event.stopPropagation();
       if (msal) msal.loginRedirect({ scopes: SCOPES }).catch((error) => notify(String(error?.message || error)));
+      return;
     }
+    const button = event.target.closest("[data-act]");
+    const act = button?.getAttribute("data-act");
+    if (!["pilot-match", "pilot-delete", "pilot-restore"].includes(act)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const run = async () => {
+      if (act === "pilot-match") {
+        const left = window.TETL_DEBUG?.detail?.key;
+        const right = document.querySelector("#pilot-match-target")?.value;
+        await writeMatch(left, right, button.getAttribute("data-choice"));
+        pilot.afterAction?.(false);
+      } else if (act === "pilot-delete") {
+        if (!window.confirm("\xBFEliminar este anuncio? Se podr\xE1 recuperar durante siete d\xEDas.")) return;
+        await deleteAd(button.getAttribute("data-key"));
+        pilot.afterAction?.(true);
+      } else {
+        await restoreAd(document.querySelector("#pilot-restore-id")?.value);
+        pilot.afterAction?.(false);
+      }
+    };
+    run().catch((error) => notify(String(error?.message || error)));
   }, true);
   window.addEventListener("online", () => {
     if (DEMO) return;
