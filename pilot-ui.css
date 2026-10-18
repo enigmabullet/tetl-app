@@ -10,3 +10,10 @@
 .d-main .kv > div { padding: 5px 8px; }
 .d-main .kv .k { font-size: 10px; line-height: 1.2; }
 .d-main .kv .v { margin-top: 1px; font-size: 13px; line-height: 1.3; }
+@media (max-width: 860px) {
+  /* Keep all three conversion controls in view on phones. */
+  #seg-area, #seg-lang { display: flex; order: 12; }
+  #seg-area { margin-left: auto; }
+  #seg-lang { order: 13; }
+  #seg-area button, #seg-lang button { min-height: 34px; }
+}

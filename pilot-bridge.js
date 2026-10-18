@@ -15814,6 +15814,72 @@ ${serverError}`);
     return [...named].map(([id, name3]) => ({ id, name: name3 }));
   }
 
+  // seismic.js
+  var fold = (value) => String(value || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+  function rolled(colonia) {
+    if (!colonia) return colonia;
+    return String(colonia).replace(/\s*,?\s*(\d+\s*[ªaoer]{0,3}|[ivx]+)\s+secc?(i[oó]n|\.)?\s*$/i, "").replace(/\s+secc?(i[oó]n|\.)?\s+(\d+|[ivx]+)\s*$/i, "").replace(/\s*\(?\s*[áa]rea\s+\d+\s*\)?\s*$/i, "").trim() || colonia;
+  }
+  function seismicLookup(seismic) {
+    const byArea = new Map(Object.entries(seismic?.by_area || {}).map(([area, zone]) => [fold(area), zone]));
+    const border = new Set((seismic?.border || []).map(fold));
+    const zones = seismic?.zones || {};
+    return (fields) => {
+      for (const candidate of [rolled(fields?.colonia), fields?.colonia_group, fields?.colonia]) {
+        const area = fold(candidate);
+        const zone = byArea.get(area);
+        if (!zone) continue;
+        const info = zones[zone] || {};
+        return {
+          zone,
+          name: info.name || zone,
+          color: info.color || null,
+          border: border.has(area)
+        };
+      }
+      return null;
+    };
+  }
+
+  // fx.js
+  var FX_ENDPOINT = "https://api.frankfurter.dev/v2/rate/USD/MXN";
+  var CACHE_KEY = "tetl.fxUsdMxn.v1";
+  function validRate(value) {
+    return Number.isFinite(value) && value > 5 && value < 60;
+  }
+  function storedFx(storage = globalThis.localStorage) {
+    try {
+      const value = JSON.parse(storage?.getItem(CACHE_KEY) || "null");
+      return validRate(value?.usd_mxn) && /^\d{4}-\d{2}-\d{2}$/.test(value?.date || "") ? value : null;
+    } catch {
+      return null;
+    }
+  }
+  async function latestFx(transport = globalThis.fetch, storage = globalThis.localStorage) {
+    const previous = storedFx(storage);
+    try {
+      const response = await transport(FX_ENDPOINT, { cache: "no-store" });
+      if (!response.ok) throw Error("Exchange-rate request failed");
+      const data = await response.json();
+      const rate = Number(data?.rate);
+      if (String(data?.base).toUpperCase() !== "USD" || String(data?.quote).toUpperCase() !== "MXN" || !validRate(rate) || !/^\d{4}-\d{2}-\d{2}$/.test(data?.date || ""))
+        throw Error("Invalid exchange-rate response");
+      const value = {
+        usd_mxn: rate,
+        date: data.date,
+        fetched_at: (/* @__PURE__ */ new Date()).toISOString(),
+        source: "frankfurter.dev"
+      };
+      try {
+        storage?.setItem(CACHE_KEY, JSON.stringify(value));
+      } catch {
+      }
+      return value;
+    } catch {
+      return previous;
+    }
+  }
+
   // native-bridge.js
   var SCOPES = ["User.Read", "Sites.Selected"];
   var ASSET_VERSION = new URL(document.currentScript?.src || location.href).searchParams.get("v") || "";
@@ -15881,7 +15947,13 @@ ${serverError}`);
   var actorId = DEMO ? "demo-person-a" : null;
   var rows = DEMO ? DEMO_ROWS : [];
   var cardObserver = null;
-  var stateText = DEMO ? "Demostraci\xF3n: datos sint\xE9ticos. Los cambios s\xF3lo duran hasta recargar." : "Preparando el cat\xE1logo privado de Tetl\u2026";
+  var both = (es, en) => ({ es, en });
+  var lang = () => window.TETL_DEBUG?.lang === "en" ? "en" : "es";
+  var wording = (value) => typeof value === "string" ? value : value?.[lang()] || value?.es || "";
+  var stateText = DEMO ? both(
+    "Demostraci\xF3n: datos sint\xE9ticos. Los cambios s\xF3lo duran hasta recargar.",
+    "Demo: synthetic data. Changes last only until reload."
+  ) : both("Preparando el cat\xE1logo privado de Tetl\u2026", "Preparing the private Tetl catalog\u2026");
   var busy = false;
   var config = null;
   var cached = null;
@@ -15889,6 +15961,9 @@ ${serverError}`);
   var recoverable = [];
   var accessConfirmed = false;
   var canSignIn = false;
+  var fx = storedFx();
+  var fixedPromise = null;
+  var seismicFor = () => null;
   var pilot = window.TETL_PILOT = {
     api,
     banner,
@@ -15903,7 +15978,10 @@ ${serverError}`);
     sync,
     reveal
   };
-  var ready = initialize().catch(() => lock("No se pudo confirmar el acceso. Recarga Tetl para reintentar."));
+  var ready = initialize().catch(() => lock(both(
+    "No se pudo confirmar el acceso. Recarga Tetl para reintentar.",
+    "Could not confirm access. Reload Tetl to try again."
+  )));
   function lock(message) {
     accessConfirmed = false;
     document.documentElement.classList.remove("tetl-authenticated");
@@ -15916,6 +15994,8 @@ ${serverError}`);
     catalogById = null;
     rows = [];
     actorId = null;
+    fixedPromise = null;
+    seismicFor = () => null;
     knownListings = [];
     recoverable = [];
     const state = window.TETL_DEBUG;
@@ -15936,7 +16016,7 @@ ${serverError}`);
   function notify(message) {
     stateText = message;
     const gateStatus = document.querySelector("#pilot-gate-status");
-    if (gateStatus) gateStatus.textContent = message;
+    if (gateStatus) gateStatus.textContent = wording(message);
     const signIn = document.querySelector("#pilot-signin");
     if (signIn) signIn.hidden = !canSignIn || accessConfirmed || DEMO;
     pilot.refresh?.();
@@ -15950,22 +16030,31 @@ ${serverError}`);
     }
   }
   function banner() {
-    const button = !DEMO && config && !account ? ' <button class="btn small primary" id="pilot-signin">Entrar con Microsoft</button>' : "";
-    const restores = recoverable.length ? ' <select id="pilot-restore-id">' + recoverable.map((item) => '<option value="' + safe(item.id) + '">' + safe(item.label) + "</option>").join("") + '</select> <button class="btn small" data-act="pilot-restore">Recuperar</button>' : "";
-    return '<div class="bar info"><b>Tetl \xB7 prototipo privado</b> \xB7 ' + safe(stateText) + button + restores + "</div>";
+    const button = !DEMO && config && !account ? ' <button class="btn small primary" id="pilot-signin">' + (lang() === "en" ? "Sign in with Microsoft" : "Entrar con Microsoft") + "</button>" : "";
+    const restores = recoverable.length ? ' <select id="pilot-restore-id">' + recoverable.map((item) => '<option value="' + safe(item.id) + '">' + safe(item.label) + "</option>").join("") + '</select> <button class="btn small" data-act="pilot-restore">' + (lang() === "en" ? "Restore" : "Recuperar") + "</button>" : "";
+    return '<div class="bar info"><b>' + (lang() === "en" ? "Tetl \xB7 private prototype" : "Tetl \xB7 prototipo privado") + "</b> \xB7 " + safe(wording(stateText)) + button + restores + "</div>";
   }
   async function token() {
     if (!account) throw Error("Entra con tu cuenta de Microsoft");
     try {
       return (await msal.acquireTokenSilent({ account, scopes: SCOPES })).accessToken;
     } catch (_) {
-      lock("La sesi\xF3n termin\xF3. Entra con Microsoft para continuar.");
+      lock(both(
+        "La sesi\xF3n termin\xF3. Entra con Microsoft para continuar.",
+        "The session ended. Sign in with Microsoft to continue."
+      ));
       throw Error("La sesi\xF3n de Microsoft termin\xF3");
     }
   }
   async function initialize() {
     if (DEMO) {
       accessConfirmed = true;
+      latestFx().then((value) => {
+        if (value) {
+          fx = value;
+          pilot.setFx?.(value);
+        }
+      });
       return;
     }
     queue = await PilotQueue.open();
@@ -15975,12 +16064,18 @@ ${serverError}`);
       if (!response.ok) throw Error("Pilot configuration unavailable");
       config = await response.json();
     } catch (_) {
-      notify("No se pudo cargar la configuraci\xF3n del piloto. Recarga la p\xE1gina al reconectar.");
+      notify(both(
+        "No se pudo cargar la configuraci\xF3n del piloto. Recarga la p\xE1gina al reconectar.",
+        "Could not load pilot settings. Reload after reconnecting."
+      ));
       return;
     }
     if (!["clientId", "tenantId", "siteId", "journalListId"].every((key) => config[key]) || config.privatePrototype !== true) {
       config = null;
-      notify("El prototipo web a\xFAn no tiene configuraci\xF3n de Microsoft. Vista local sin datos.");
+      notify(both(
+        "El prototipo web a\xFAn no tiene configuraci\xF3n de Microsoft. Vista local sin datos.",
+        "Microsoft settings are not configured for this prototype. No private data is available."
+      ));
       return;
     }
     msal = new PublicClientApplication({ auth: {
@@ -15994,13 +16089,13 @@ ${serverError}`);
     const accounts = msal.getAllAccounts();
     account = result?.account || accounts.find((item) => item.homeAccountId === cached?.homeAccountId) || (accounts.length === 1 ? accounts[0] : null);
     if (!account) {
-      notify("Entra con Microsoft para abrir Tetl.");
+      notify(both("Entra con Microsoft para abrir Tetl.", "Sign in with Microsoft to open Tetl."));
       return;
     }
     msal.setActiveAccount(account);
     graph = new GraphPilot(config, token);
     if (!config.driveId || !config.catalogPath || !config.mediaRoot) {
-      notify("El cat\xE1logo privado a\xFAn no est\xE1 configurado.");
+      notify(both("El cat\xE1logo privado a\xFAn no est\xE1 configurado.", "The private catalog is not configured."));
       return;
     }
     files = new GraphPrivateFiles(config, token);
@@ -16010,15 +16105,37 @@ ${serverError}`);
       catalogPeople = privateCatalog.people || [];
       catalogById = new Map(catalog.map((ad) => [ad.ad_id, ad]));
     } catch (_) {
-      notify("No se pudo confirmar el acceso al cat\xE1logo privado. Reintenta al reconectar.");
+      notify(both(
+        "No se pudo confirmar el acceso al cat\xE1logo privado. Reintenta al reconectar.",
+        "Could not confirm access to the private catalog. Try again after reconnecting."
+      ));
       return;
+    }
+    try {
+      await fixedSearches();
+    } catch (_) {
+      notify(both(
+        "No se pudo cargar la zonificaci\xF3n privada. Reintenta al reconectar.",
+        "Could not load private seismic zoning. Try again after reconnecting."
+      ));
     }
     if (cached?.homeAccountId === account.homeAccountId && cached.actorId && Array.isArray(cached.rows)) {
       actorId = cached.actorId;
       rows = cached.rows;
-      notify("Mostrando la copia local. Pulsa Sincronizar para confirmar con SharePoint.");
+      notify(both(
+        "Mostrando la copia local. Pulsa Sincronizar para confirmar con SharePoint.",
+        "Showing the local copy. Tap Sync to confirm with SharePoint."
+      ));
     }
     if (await sync()) accessConfirmed = true;
+    if (accessConfirmed && (!fx || fx.fetched_at?.slice(0, 10) !== now().slice(0, 10))) {
+      latestFx().then((value) => {
+        if (value && accessConfirmed) {
+          fx = value;
+          pilot.setFx?.(value);
+        }
+      });
+    }
   }
   function actors(allRows) {
     if (!DEMO) {
@@ -16105,15 +16222,24 @@ ${serverError}`);
   async function fixedSearches() {
     if (DEMO) return { types: [], areas: [], ranchos: [], i24_all: null };
     if (!files || !config.fixedSearchesPath) throw Error("B\xFAsquedas privadas no disponibles");
-    return files.json(config.fixedSearchesPath);
+    if (!fixedPromise) fixedPromise = files.json(config.fixedSearchesPath).then((data) => {
+      seismicFor = seismicLookup(data.seismic);
+      return data;
+    }).catch((error) => {
+      fixedPromise = null;
+      throw error;
+    });
+    return fixedPromise;
   }
   function searchForm() {
-    return '<div class="pilot-actions"><h4>B\xFAsqueda guardada</h4><input id="s-name" class="f-input" placeholder="Nombre" aria-label="Nombre de b\xFAsqueda"> <input id="s-url" class="f-input" placeholder="https://\u2026" aria-label="Enlace de b\xFAsqueda"> <button class="btn small" data-act="s-add">Guardar</button></div>';
+    const en = lang() === "en";
+    return '<div class="pilot-actions"><h4>' + (en ? "Saved search" : "B\xFAsqueda guardada") + '</h4><input id="s-name" class="f-input" placeholder="' + (en ? "Name" : "Nombre") + '" aria-label="' + (en ? "Search name" : "Nombre de b\xFAsqueda") + '"> <input id="s-url" class="f-input" placeholder="https://\u2026" aria-label="' + (en ? "Search link" : "Enlace de b\xFAsqueda") + '"> <button class="btn small" data-act="s-add">' + (en ? "Save" : "Guardar") + "</button></div>";
   }
   function controls(listing) {
     if (!DEMO && !catalogById?.has(listing.key) && listing.tetl_prototype !== true) return "";
     const choices = knownListings.filter((item) => item.key !== listing.key);
-    return '<div class="pilot-actions"><h4>Propiedad y recuperaci\xF3n</h4>' + (choices.length ? '<select id="pilot-match-target" aria-label="Otro anuncio">' + choices.map((item) => '<option value="' + safe(item.key) + '">' + safe(item.title) + "</option>").join("") + '</select><p><button class="btn small" data-act="pilot-match" data-choice="same">Misma propiedad</button> <button class="btn small" data-act="pilot-match" data-choice="different">Distinta</button> <button class="btn small" data-act="pilot-match" data-choice="unsure">No s\xE9</button></p>' : "") + '<button class="btn small" data-act="pilot-delete" data-key="' + safe(listing.key) + '">Eliminar \xB7 recuperable 7 d\xEDas</button></div>';
+    const en = lang() === "en";
+    return '<div class="pilot-actions"><h4>' + (en ? "Property and recovery" : "Propiedad y recuperaci\xF3n") + "</h4>" + (choices.length ? '<select id="pilot-match-target" aria-label="' + (en ? "Other listing" : "Otro anuncio") + '">' + choices.map((item) => '<option value="' + safe(item.key) + '">' + safe(item.title) + "</option>").join("") + '</select><p><button class="btn small" data-act="pilot-match" data-choice="same">' + (en ? "Same property" : "Misma propiedad") + '</button> <button class="btn small" data-act="pilot-match" data-choice="different">' + (en ? "Different" : "Distinta") + '</button> <button class="btn small" data-act="pilot-match" data-choice="unsure">' + (en ? "Unsure" : "No s\xE9") + "</button></p>" : "") + '<button class="btn small" data-act="pilot-delete" data-key="' + safe(listing.key) + '">' + (en ? "Delete \xB7 recoverable for 7 days" : "Eliminar \xB7 recuperable 7 d\xEDas") + "</button></div>";
   }
   function asListing(ad, projection, people) {
     const f = ad.fields || {};
@@ -16144,6 +16270,7 @@ ${serverError}`);
       history: catalogById?.get(ad.ad_id)?.history || [],
       amenities: f.amenities || [],
       archived: !!f.archived,
+      seismic: seismicFor(f),
       dupes: members(projection.state, ad.ad_id).filter((id) => id !== ad.ad_id)
     };
   }
@@ -16163,11 +16290,17 @@ ${serverError}`);
     const payload = { ad_id: key, values, base_response_rev: base };
     if (DEMO) {
       rows.push(demoRow(rows.length + 1, "demo-response-" + rows.length, "respond", payload, actorId, now()));
-      notify("Cambio de demostraci\xF3n aplicado s\xF3lo en este navegador.");
+      notify(both(
+        "Cambio de demostraci\xF3n aplicado s\xF3lo en este navegador.",
+        "Demo change applied only in this browser."
+      ));
     } else {
       await queue.enqueue("respond", payload, actorId);
       const pending = (await queue.all()).filter((item) => !item.receipt).length;
-      notify(pending + " cambio" + (pending === 1 ? "" : "s") + " pendiente" + (pending === 1 ? "" : "s") + " en este dispositivo.");
+      notify(both(
+        pending + " cambio" + (pending === 1 ? "" : "s") + " pendiente" + (pending === 1 ? "" : "s") + " en este dispositivo.",
+        pending + " pending change" + (pending === 1 ? "" : "s") + " on this device."
+      ));
       if (navigator.onLine) sync().catch(() => {
       });
     }
@@ -16178,11 +16311,17 @@ ${serverError}`);
     if (DEMO) {
       const id2 = "demo-" + crypto.randomUUID();
       rows.push(demoRow(rows.length + 1, id2, kind, payload, actorId, now()));
-      notify("Cambio de demostraci\xF3n aplicado s\xF3lo en este navegador.");
+      notify(both(
+        "Cambio de demostraci\xF3n aplicado s\xF3lo en este navegador.",
+        "Demo change applied only in this browser."
+      ));
       return id2;
     }
     const id = await queue.enqueue(kind, payload, actorId);
-    notify("Cambio pendiente de confirmar con SharePoint.");
+    notify(both(
+      "Cambio pendiente de confirmar con SharePoint.",
+      "Change waiting for SharePoint confirmation."
+    ));
     if (syncNow && navigator.onLine) sync().catch(() => {
     });
     return id;
@@ -16257,7 +16396,7 @@ ${serverError}`);
       const projection = await projected();
       return {
         onedrive: { ok: true },
-        fx: {},
+        fx: fx || {},
         people: actors(projection.all),
         me: actorId,
         remote: true,
@@ -16296,7 +16435,7 @@ ${serverError}`);
     if (path === "/api/logout") {
       if (msal && account) {
         const signingOut = account;
-        lock("Cerrando sesi\xF3n\u2026");
+        lock(both("Cerrando sesi\xF3n\u2026", "Signing out\u2026"));
         await msal.logoutRedirect({
           account: signingOut,
           postLogoutRedirectUri: location.origin + location.pathname
@@ -16321,13 +16460,16 @@ ${serverError}`);
   }
   async function sync() {
     if (DEMO) {
-      notify("Demostraci\xF3n local: no hay conexi\xF3n con SharePoint.");
+      notify(both(
+        "Demostraci\xF3n local: no hay conexi\xF3n con SharePoint.",
+        "Local demo: no SharePoint connection."
+      ));
       return true;
     }
     if (!graph || !account || busy) return false;
     busy = true;
     let accessReady = false;
-    notify("Sincronizando con SharePoint\u2026");
+    notify(both("Sincronizando con SharePoint\u2026", "Syncing with SharePoint\u2026"));
     try {
       const signedActor = await graph.currentUser();
       if (actorId && actorId !== signedActor) throw Error("Hay cambios de otra cuenta en este dispositivo");
@@ -16377,12 +16519,24 @@ ${serverError}`);
       const pending = items.filter((item) => !item.receipt).length;
       const confirmed = items.filter((item) => status(item) === "accepted").length;
       const conflicts = items.filter((item) => status(item) && status(item) !== "accepted").length;
-      notify(pending ? pending + " cambio(s) pendientes en este dispositivo." : "SharePoint confirm\xF3 los cambios." + (confirmed ? " " + confirmed + " cambio(s) recibido(s)." : "") + (conflicts ? " " + conflicts + " conflicto(s) por revisar." : ""));
+      notify(pending ? both(
+        pending + " cambio(s) pendientes en este dispositivo.",
+        pending + " pending change(s) on this device."
+      ) : both(
+        "SharePoint confirm\xF3 los cambios." + (confirmed ? " " + confirmed + " cambio(s) recibido(s)." : "") + (conflicts ? " " + conflicts + " conflicto(s) por revisar." : ""),
+        "SharePoint confirmed the changes." + (confirmed ? " " + confirmed + " change(s) received." : "") + (conflicts ? " " + conflicts + " conflict(s) to review." : "")
+      ));
       accessReady = true;
     } catch (error) {
       if (error?.status === 401 || error?.status === 403)
-        lock("La sesi\xF3n o el acceso a Tetl termin\xF3. Entra con Microsoft para continuar.");
-      else notify("Sin conexi\xF3n o sin acceso: " + String(error?.message || error));
+        lock(both(
+          "La sesi\xF3n o el acceso a Tetl termin\xF3. Entra con Microsoft para continuar.",
+          "The session or Tetl access ended. Sign in with Microsoft to continue."
+        ));
+      else notify(both(
+        "Sin conexi\xF3n o sin acceso: " + String(error?.message || error),
+        "Offline or no access: " + String(error?.message || error)
+      ));
     } finally {
       busy = false;
       pilot.refresh?.();
